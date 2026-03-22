@@ -1,0 +1,1343 @@
+local __DARKLUA_BUNDLE_MODULES = {cache = {}}
+
+do
+    do
+        local __modImpl = function()
+            local RunService = game:GetService('RunService')
+            local FN_MARKER = newproxy()
+            local THREAD_MARKER = newproxy()
+            local GENERIC_OBJECT_CLEANUP_METHODS = table.freeze({
+                'Destroy',
+                'Disconnect',
+                'destroy',
+                'disconnect',
+            })
+            local getObjectCleanupFunction = function(object, cleanupMethod)
+                local t = typeof(object)
+
+                if t == 'function' then
+                    return FN_MARKER
+                elseif t == 'thread' then
+                    return THREAD_MARKER
+                end
+                if cleanupMethod then
+                    return cleanupMethod
+                end
+                if t == 'Instance' then
+                    return 'Destroy'
+                elseif t == 'RBXScriptConnection' then
+                    return 'Disconnect'
+                elseif t == 'table' then
+                    for _, genericCleanupMethod in GENERIC_OBJECT_CLEANUP_METHODS do
+                        if typeof(object[genericCleanupMethod]) == 'function' then
+                            return genericCleanupMethod
+                        end
+                    end
+                end
+
+                error(string.format('failed to get cleanup function for object %s: %s', tostring(t), tostring(object)), 3)
+            end
+            local assertPromiseLike = function(object)
+                if typeof(object) ~= 'table' or typeof(object.getStatus) ~= 'function' or typeof(object.finally) ~= 'function' or typeof(object.cancel) ~= 'function' then
+                    error('did not receive a promise as an argument', 3)
+                end
+            end
+            local assertSignalLike = function(object)
+                if typeof(object) ~= 'RBXScriptSignal' and (typeof(object) ~= 'table' or typeof(object.Connect) ~= 'function' or typeof(object.Once) ~= 'function') then
+                    error('did not receive a signal as an argument', 3)
+                end
+            end
+            local Trove = {}
+
+            Trove.__index = Trove
+
+            function Trove.new()
+                local self = setmetatable({}, Trove)
+
+                self._objects = {}
+                self._cleaning = false
+
+                return (self)
+            end
+            function Trove.Add(self, object, cleanupMethod)
+                if self._cleaning then
+                    error('cannot call trove:Add() while cleaning', 2)
+                end
+
+                local cleanup = getObjectCleanupFunction(object, cleanupMethod)
+
+                table.insert(self._objects, {object, cleanup})
+
+                return object
+            end
+            function Trove.Clone(self, instance)
+                if self._cleaning then
+                    error('cannot call trove:Clone() while cleaning', 2)
+                end
+
+                return self:Add(instance:Clone())
+            end
+            function Trove.Construct(self, class, ...)
+                if self._cleaning then
+                    error('Cannot call trove:Construct() while cleaning', 2)
+                end
+
+                local object = nil
+                local t = type(class)
+
+                if t == 'table' then
+                    object = (class).new(...)
+                elseif t == 'function' then
+                    object = (class)(...)
+                end
+
+                return self:Add(object)
+            end
+            function Trove.Connect(self, signal, fn)
+                if self._cleaning then
+                    error('Cannot call trove:Connect() while cleaning', 2)
+                end
+
+                assertSignalLike(signal)
+
+                local confirmedSignal = signal
+
+                return self:Add(confirmedSignal:Connect(fn))
+            end
+            function Trove.Once(self, signal, fn)
+                if self._cleaning then
+                    error('Cannot call trove:Connect() while cleaning', 2)
+                end
+
+                assertSignalLike(signal)
+
+                local confirmedSignal = signal
+                local conn
+
+                conn = confirmedSignal:Once(function(...)
+                    fn(...)
+                    self:Pop(conn)
+                end)
+
+                return self:Add(conn)
+            end
+            function Trove.BindToRenderStep(self, name, priority, fn)
+                if self._cleaning then
+                    error('cannot call trove:BindToRenderStep() while cleaning', 2)
+                end
+
+                RunService:BindToRenderStep(name, priority, fn)
+                self:Add(function()
+                    RunService:UnbindFromRenderStep(name)
+                end)
+            end
+            function Trove.AddPromise(self, promise)
+                if self._cleaning then
+                    error('cannot call trove:AddPromise() while cleaning', 2)
+                end
+
+                assertPromiseLike(promise)
+
+                local confirmedPromise = promise
+
+                if confirmedPromise:getStatus() == 'Started' then
+                    confirmedPromise:finally(function()
+                        if self._cleaning then
+                            return
+                        end
+
+                        self:_findAndRemoveFromObjects(confirmedPromise, false)
+                    end)
+                    self:Add(confirmedPromise, 'cancel')
+                end
+
+                return confirmedPromise
+            end
+            function Trove.Remove(self, object)
+                if self._cleaning then
+                    error('cannot call trove:Remove() while cleaning', 2)
+                end
+
+                return self:_findAndRemoveFromObjects(object, true)
+            end
+            function Trove.Pop(self, object)
+                if self._cleaning then
+                    error('cannot call trove:Pop() while cleaning', 2)
+                end
+
+                return self:_findAndRemoveFromObjects(object, false)
+            end
+            function Trove.Extend(self)
+                if self._cleaning then
+                    error('cannot call trove:Extend() while cleaning', 2)
+                end
+
+                return self:Construct(Trove)
+            end
+            function Trove.Clean(self)
+                if self._cleaning then
+                    return
+                end
+
+                self._cleaning = true
+
+                for _, obj in self._objects do
+                    self:_cleanupObject(obj[1], obj[2])
+                end
+
+                table.clear(self._objects)
+
+                self._cleaning = false
+            end
+            function Trove.WrapClean(self)
+                return function()
+                    self:Clean()
+                end
+            end
+            function Trove._findAndRemoveFromObjects(self, object, cleanup)
+                local objects = self._objects
+
+                for i, obj in objects do
+                    if obj[1] == object then
+                        local n = #objects
+
+                        objects[i] = objects[n]
+                        objects[n] = nil
+
+                        if cleanup then
+                            self:_cleanupObject(obj[1], obj[2])
+                        end
+
+                        return true
+                    end
+                end
+
+                return false
+            end
+            function Trove._cleanupObject(_self, object, cleanupMethod)
+                if cleanupMethod == FN_MARKER then
+                    task.spawn(object)
+                elseif cleanupMethod == THREAD_MARKER then
+                    pcall(task.cancel, object)
+                else
+                    object[cleanupMethod](object)
+                end
+            end
+            function Trove.AttachToInstance(self, instance)
+                if self._cleaning then
+                    error('cannot call trove:AttachToInstance() while cleaning', 2)
+                elseif not instance:IsDescendantOf(game) then
+                    error('instance is not a descendant of the game hierarchy', 2)
+                end
+
+                return self:Connect(instance.Destroying, function()
+                    self:Destroy()
+                end)
+            end
+            function Trove.Destroy(self)
+                self:Clean()
+            end
+
+            return {
+                new = Trove.new,
+            }
+        end
+
+        function __DARKLUA_BUNDLE_MODULES.a()
+            local v = __DARKLUA_BUNDLE_MODULES.cache.a
+
+            if not v then
+                v = {
+                    c = __modImpl(),
+                }
+                __DARKLUA_BUNDLE_MODULES.cache.a = v
+            end
+
+            return v.c
+        end
+    end
+    do
+        local __modImpl = function()
+            local module = __DARKLUA_BUNDLE_MODULES.a()
+
+            return module
+        end
+
+        function __DARKLUA_BUNDLE_MODULES.b()
+            local v = __DARKLUA_BUNDLE_MODULES.cache.b
+
+            if not v then
+                v = {
+                    c = __modImpl(),
+                }
+                __DARKLUA_BUNDLE_MODULES.cache.b = v
+            end
+
+            return v.c
+        end
+    end
+    do
+        local __modImpl = function()
+            return true
+        end
+
+        function __DARKLUA_BUNDLE_MODULES.c()
+            local v = __DARKLUA_BUNDLE_MODULES.cache.c
+
+            if not v then
+                v = {
+                    c = __modImpl(),
+                }
+                __DARKLUA_BUNDLE_MODULES.cache.c = v
+            end
+
+            return v.c
+        end
+    end
+    do
+        local __modImpl = function()
+            local Trove = __DARKLUA_BUNDLE_MODULES.b()
+            local Players = game:GetService('Players')
+            local localPlayer = Players.LocalPlayer
+            local PlayerObject = {}
+
+            PlayerObject.__index = PlayerObject
+
+            function PlayerObject.new(Player)
+                local self = {
+                    _trove = Trove.new(),
+                    instance = Player,
+                    bodyParts = {},
+                    health = 0,
+                    friend = localPlayer:IsFriendsWithAsync(Player.UserId),
+                    forceField = false,
+                }
+
+                self = setmetatable(self, PlayerObject)
+
+                self:Initialise()
+
+                return self
+            end
+            function PlayerObject.Initialise(self)
+                local trove = self._trove
+
+                self:OnCharacterAdded(self.instance.Character)
+                trove:Connect(self.instance.CharacterAdded, function(Character)
+                    self:OnCharacterAdded(Character)
+                end)
+                trove:Connect(self.instance.CharacterRemoving, function(
+                    Character
+                )
+                    self:OnCharacterRemoved(Character)
+                end)
+            end
+            function PlayerObject.Destroy(self)
+                self._trove:Destroy()
+                setmetatable(self, nil)
+            end
+            function PlayerObject.OnChildAdded(self, child)
+                if child:IsA('BasePart') then
+                    table.insert(self.bodyParts, child)
+                elseif child:IsA('Humanoid') then
+                    self._trove:Connect(child.HealthChanged, function(Health)
+                        self.health = Health
+                    end)
+                elseif child:IsA('ForceField') then
+                    self.forceField = true
+                end
+            end
+            function PlayerObject.OnChildRemoved(self, child)
+                if child:IsA('BasePart') then
+                    local bodyPartIndex = table.find(self.bodyParts, child)
+
+                    if bodyPartIndex then
+                        table.remove(self.bodyParts, bodyPartIndex)
+                    end
+                elseif child:IsA('Humanoid') then
+                    self.health = 0
+                elseif child:IsA('ForceField') then
+                    self.forceField = false
+                end
+            end
+            function PlayerObject.OnCharacterAdded(self, character)
+                if not character then
+                    return
+                end
+
+                self.character = character
+
+                for _, v in ipairs(character:GetChildren())do
+                    self:OnChildAdded(v)
+                end
+
+                local trove = self._trove
+
+                trove:Connect(character.ChildAdded, function(Child)
+                    self:OnChildAdded(Child)
+                end)
+                trove:Connect(character.ChildRemoved, function(Child)
+                    self:OnChildRemoved(Child)
+                end)
+            end
+            function PlayerObject.OnCharacterRemoved(self, _character)
+                self.character = nil
+                self.health = 0
+
+                table.clear(self.bodyParts)
+            end
+
+            return PlayerObject
+        end
+
+        function __DARKLUA_BUNDLE_MODULES.d()
+            local v = __DARKLUA_BUNDLE_MODULES.cache.d
+
+            if not v then
+                v = {
+                    c = __modImpl(),
+                }
+                __DARKLUA_BUNDLE_MODULES.cache.d = v
+            end
+
+            return v.c
+        end
+    end
+    do
+        local __modImpl = function()
+            __DARKLUA_BUNDLE_MODULES.c()
+            __DARKLUA_BUNDLE_MODULES.d()
+
+            local Configuration = {
+                Checks = {
+                    ForceField = true,
+                    Friend = true,
+                    Health = true,
+                    Invisible = true,
+                    Ignored = true,
+                    WallCheck = 'Full',
+                },
+                FOVSettings = {
+                    Kind = 'Circle',
+                    Value = {
+                        Visible = true,
+                        Thickness = 1,
+                        Radius = 60,
+                        Color = Color3.fromRGB(231, 84, 128),
+                    },
+                },
+                Ignored = {
+                    IgnoreLocalTeam = true,
+                    Whitelist = {
+                        Teams = false,
+                        Players = false,
+                    },
+                    Teams = {},
+                    Players = {},
+                },
+                RaycastIgnore = function(player, camera)
+                    local ignored = {camera}
+
+                    if player.character then
+                        table.insert(ignored, player.character)
+                    end
+
+                    return ignored
+                end,
+            }
+
+            return Configuration
+        end
+
+        function __DARKLUA_BUNDLE_MODULES.e()
+            local v = __DARKLUA_BUNDLE_MODULES.cache.e
+
+            if not v then
+                v = {
+                    c = __modImpl(),
+                }
+                __DARKLUA_BUNDLE_MODULES.cache.e = v
+            end
+
+            return v.c
+        end
+    end
+    do
+        local __modImpl = function()
+            local Trove = __DARKLUA_BUNDLE_MODULES.b()
+            local PlayerObject = __DARKLUA_BUNDLE_MODULES.d()
+            local Players = game:GetService('Players')
+            local StarterGui = game:GetService('StarterGui')
+            local LocalPlayer = Players.LocalPlayer
+            local PlayerTracker = {}
+
+            PlayerTracker.__index = PlayerTracker
+
+            function PlayerTracker.new()
+                local self = {
+                    _trove = Trove.new(),
+                    localPlayer = PlayerObject.new(LocalPlayer),
+                    players = {},
+                }
+
+                self = setmetatable(self, PlayerTracker)
+
+                self:Initialise()
+
+                return self
+            end
+            function PlayerTracker.Initialise(self)
+                for _, player in ipairs(Players:GetPlayers())do
+                    self:OnPlayerAdded(player)
+                end
+
+                local trove = self._trove
+
+                trove:Connect(Players.PlayerAdded, function(Player)
+                    self:OnPlayerAdded(Player)
+                end)
+                trove:Connect(Players.PlayerRemoving, function(Player)
+                    self:OnPlayerRemoved(Player)
+                end)
+                trove:Connect(StarterGui:GetCore('PlayerFriendedEvent').Event, function(
+                    Player
+                )
+                    local _, player = self:GetFromInstance(Player)
+
+                    if not player then
+                        return
+                    end
+
+                    player.friend = true
+                end)
+                trove:Connect(StarterGui:GetCore('PlayerUnfriendedEvent').Event, function(
+                    Player
+                )
+                    local _, player = self:GetFromInstance(Player)
+
+                    if not player then
+                        return
+                    end
+
+                    player.friend = false
+                end)
+            end
+            function PlayerTracker.Destroy(self)
+                self._trove:Destroy()
+                setmetatable(self, self)
+            end
+            function PlayerTracker.GetFromInstance(self, playerInstance)
+                for i, player in ipairs(self.players)do
+                    if player.instance == playerInstance then
+                        return i, player
+                    end
+                end
+
+                return nil, nil
+            end
+            function PlayerTracker.OnPlayerAdded(self, playerInstance)
+                if playerInstance == LocalPlayer or self:GetFromInstance(playerInstance) then
+                    return
+                end
+
+                local player = PlayerObject.new(playerInstance)
+
+                table.insert(self.players, player)
+            end
+            function PlayerTracker.OnPlayerRemoved(self, Player)
+                local playerIndex = self:GetFromInstance(Player)
+
+                if not playerIndex then
+                    return
+                end
+
+                table.remove(self.players, playerIndex)
+            end
+
+            return PlayerTracker
+        end
+
+        function __DARKLUA_BUNDLE_MODULES.f()
+            local v = __DARKLUA_BUNDLE_MODULES.cache.f
+
+            if not v then
+                v = {
+                    c = __modImpl(),
+                }
+                __DARKLUA_BUNDLE_MODULES.cache.f = v
+            end
+
+            return v.c
+        end
+    end
+    do
+        local __modImpl = function()
+            local function mergeTables(Destination, Source)
+                if typeof(Destination) ~= 'table' or typeof(Source) ~= 'table' then
+                    return Destination
+                end
+
+                for i, v in pairs(Source)do
+                    Destination = Destination
+
+                    local DestinationValue = Destination[i]
+
+                    if typeof(DestinationValue) == 'table' and typeof(v) == 'table' then
+                        v = mergeTables(DestinationValue, v)
+                    end
+
+                    Destination[i] = v
+                end
+
+                return Destination
+            end
+
+            return mergeTables
+        end
+
+        function __DARKLUA_BUNDLE_MODULES.g()
+            local v = __DARKLUA_BUNDLE_MODULES.cache.g
+
+            if not v then
+                v = {
+                    c = __modImpl(),
+                }
+                __DARKLUA_BUNDLE_MODULES.cache.g = v
+            end
+
+            return v.c
+        end
+    end
+    do
+        local __modImpl = function()
+            local isPointInsideRect = function(point, centre, size)
+                local topLeft = centre - size / 2
+                local bottomRight = centre + size / 2
+
+                return point.X >= topLeft.X and point.X <= bottomRight.X and point.Y >= topLeft.Y and point.Y <= bottomRight.Y, (centre - point).Magnitude
+            end
+
+            return isPointInsideRect
+        end
+
+        function __DARKLUA_BUNDLE_MODULES.h()
+            local v = __DARKLUA_BUNDLE_MODULES.cache.h
+
+            if not v then
+                v = {
+                    c = __modImpl(),
+                }
+                __DARKLUA_BUNDLE_MODULES.cache.h = v
+            end
+
+            return v.c
+        end
+    end
+    do
+        local __modImpl = function()
+            __DARKLUA_BUNDLE_MODULES.c()
+
+            local mergeTables = __DARKLUA_BUNDLE_MODULES.g()
+            local isPointInsideRect = __DARKLUA_BUNDLE_MODULES.h()
+            local UserInputService = game:GetService('UserInputService')
+            local fovDefaults = table.freeze({
+                Line = {
+                    Visible = false,
+                    ZIndex = 1,
+                    Transparency = 0,
+                    Color = Color3.new(),
+                    Thickness = 1,
+                    From = Vector2.zero,
+                    To = Vector2.zero,
+                },
+                Text = {
+                    Visible = false,
+                    ZIndex = 1,
+                    Transparency = 0,
+                    Color = Color3.new(),
+                    Text = '',
+                    Size = 12,
+                    Center = true,
+                    Outline = false,
+                    OutlineColor = Color3.new(),
+                    Position = Vector2.zero,
+                    TextBounds = Vector2.zero,
+                },
+                Image = {
+                    Visible = false,
+                    ZIndex = 1,
+                    Transparency = 0,
+                    Color = Color3.new(),
+                    Data = '',
+                    Size = Vector2.zero,
+                    Position = Vector2.zero,
+                    Rounding = 0,
+                },
+                Circle = {
+                    Visible = false,
+                    ZIndex = 1,
+                    Transparency = 0,
+                    Color = Color3.new(),
+                    Thickness = 1,
+                    NumSides = 100,
+                    Radius = 0,
+                    Filled = false,
+                    Position = Vector2.zero,
+                },
+                Square = {
+                    Visible = false,
+                    ZIndex = 1,
+                    Transparency = 0,
+                    Color = Color3.new(),
+                    Thickness = 1,
+                    Size = Vector2.zero,
+                    Position = Vector2.zero,
+                    Filled = false,
+                },
+                Quad = {
+                    Visible = false,
+                    ZIndex = 1,
+                    Transparency = 0,
+                    Color = Color3.new(),
+                    Thickness = 1,
+                    PointA = Vector2.zero,
+                    PointB = Vector2.zero,
+                    PointC = Vector2.zero,
+                    PointD = Vector2.zero,
+                    Filled = false,
+                },
+                Triangle = {
+                    Visible = false,
+                    ZIndex = 1,
+                    Transparency = 0,
+                    Color = Color3.new(),
+                    Thickness = 1,
+                    PointA = Vector2.zero,
+                    PointB = Vector2.zero,
+                    PointC = Vector2.zero,
+                    Filled = false,
+                },
+            })
+            local FovObject = {}
+
+            FovObject.__index = FovObject
+
+            function FovObject.new(id, drawingData)
+                local defaults = (fovDefaults)[drawingData.Kind]
+
+                assert(defaults, 'could not find drawing defaults')
+
+                defaults = table.clone(defaults)
+
+                local self = {
+                    id = id,
+                    drawing = {
+                        Kind = drawingData.Kind,
+                        Data = mergeTables(defaults, drawingData.Value),
+                        Value = nil,
+                    },
+                }
+
+                self = setmetatable(self, FovObject)
+
+                self:CreateDrawing()
+
+                return self
+            end
+            function FovObject.Destroy(self)
+                local object = self.drawing.Value
+
+                if object then
+                    object:Remove()
+                end
+            end
+            function FovObject.CreateDrawing(self)
+                if not Drawing then
+                    return
+                end
+
+                local drawingObject = ((Drawing.new))(self.drawing.Kind)
+
+                self.drawing.Value = drawingObject
+
+                self:SetDrawingData()
+            end
+            function FovObject.SetDrawingData(self)
+                local object = self.drawing.Value
+
+                if not object then
+                    return
+                end
+
+                for i, v in self.drawing.Data do
+                    (object)[i] = v
+                end
+            end
+            function FovObject.Update(self)
+                local drawingData = self.drawing
+
+                if drawingData.Kind == 'Circle' then
+                    drawingData.Data.Position = UserInputService:GetMouseLocation()
+                elseif drawingData.Kind == 'Text' then
+                    if drawingData.Value then
+                        drawingData.Data.TextBounds = drawingData.Value.TextBounds
+                    end
+                end
+
+                self:SetDrawingData()
+            end
+            function FovObject.InsideFOV(self, position)
+                local drawing = self.drawing
+
+                if drawing.Kind == 'Line' then
+                    local drawingData = drawing.Data
+                    local lineDirection = drawingData.To - drawingData.From
+                    local pointDirection = position - drawingData.From
+                    local projection = pointDirection:Dot(lineDirection.Unit)
+
+                    if not (projection >= 0 and projection <= lineDirection.Magnitude) then
+                        return false, nil
+                    end
+
+                    local closestPoint = drawingData.From + lineDirection.Unit * projection
+                    local distance = (closestPoint - position).Magnitude
+
+                    return distance <= drawingData.Thickness / 2, distance
+                elseif drawing.Kind == 'Text' then
+                    local drawingData = drawing.Data
+
+                    return isPointInsideRect(position, drawingData.Position, drawingData.TextBounds)
+                elseif drawing.Kind == 'Image' or drawing.Kind == 'Square' then
+                    local drawingData = drawing.Data
+
+                    return isPointInsideRect(position, drawingData.Position, drawingData.Size)
+                elseif drawing.Kind == 'Circle' then
+                    local drawingData = drawing.Data
+                    local distance = (drawingData.Position - position).Magnitude
+
+                    return distance < drawingData.Radius, distance
+                elseif drawing.Kind == 'Quad' then
+                    local drawingData = drawing.Data
+                    local points = {
+                        drawingData.PointA,
+                        drawingData.PointB,
+                        drawingData.PointC,
+                        drawingData.PointD,
+                    }
+                    local centre = (drawingData.PointA + drawingData.PointB + drawingData.PointC + drawingData.PointD) / 4
+                    local isInside = true
+
+                    for i = 1, 4 do
+                        local A = points[i]
+                        local B = points[i % 4 + 1]
+                        local AB = B - A
+                        local AP = position - A
+
+                        if AB:Cross(AP) < 0 then
+                            isInside = false
+
+                            break
+                        end
+                    end
+
+                    return isInside, (centre - position).Magnitude
+                elseif drawing.Kind == 'Triangle' then
+                    local drawingData = drawing.Data
+                    local points = {
+                        drawingData.PointA,
+                        drawingData.PointB,
+                        drawingData.PointC,
+                    }
+                    local centre = (drawingData.PointA + drawingData.PointB + drawingData.PointC) / 3
+                    local isInside = true
+
+                    for i = 1, 3 do
+                        local A = points[i]
+                        local B = points[i % 3 + 1]
+                        local AB = B - A
+                        local AP = position - A
+
+                        if AB:Cross(AP) < 0 then
+                            isInside = false
+
+                            break
+                        end
+                    end
+
+                    return isInside, (centre - position).Magnitude
+                end
+
+                return false, nil
+            end
+
+            return FovObject
+        end
+
+        function __DARKLUA_BUNDLE_MODULES.i()
+            local v = __DARKLUA_BUNDLE_MODULES.cache.i
+
+            if not v then
+                v = {
+                    c = __modImpl(),
+                }
+                __DARKLUA_BUNDLE_MODULES.cache.i = v
+            end
+
+            return v.c
+        end
+    end
+    do
+        local __modImpl = function()
+            local Trove = __DARKLUA_BUNDLE_MODULES.b()
+
+            __DARKLUA_BUNDLE_MODULES.i()
+
+            local VisualHandler = {}
+
+            VisualHandler.__index = VisualHandler
+
+            function VisualHandler.new()
+                local self = {
+                    _trove = Trove.new(),
+                    objects = {},
+                }
+
+                return setmetatable(self, VisualHandler)
+            end
+            function VisualHandler.Add(self, fovObject, data)
+                if self.objects[fovObject] then
+                    return false
+                end
+
+                self.objects[fovObject] = data or {
+                    update = true,
+                    check = true,
+                }
+
+                self._trove:Add(fovObject)
+
+                return true
+            end
+            function VisualHandler.Update(self)
+                for fovObject, data in pairs(self.objects)do
+                    if data.update then
+                        fovObject:Update()
+                    end
+                end
+            end
+            function VisualHandler.Check(self, position, fetchAll)
+                local allSuccess = true
+                local results = {}
+
+                for fovObject, data in pairs(self.objects)do
+                    if not data.check then
+                        continue
+                    end
+
+                    local result = fovObject:InsideFOV(position)
+
+                    if not result then
+                        allSuccess = false
+
+                        if not fetchAll then
+                            return {}, false
+                        end
+                    end
+
+                    results[fovObject.id] = result
+                end
+
+                return results, allSuccess
+            end
+            function VisualHandler.Destroy(self)
+                self._trove:Destroy()
+                setmetatable(self, nil)
+            end
+
+            return VisualHandler
+        end
+
+        function __DARKLUA_BUNDLE_MODULES.j()
+            local v = __DARKLUA_BUNDLE_MODULES.cache.j
+
+            if not v then
+                v = {
+                    c = __modImpl(),
+                }
+                __DARKLUA_BUNDLE_MODULES.cache.j = v
+            end
+
+            return v.c
+        end
+    end
+    do
+        local __modImpl = function()
+            local Workspace = game:GetService('Workspace')
+            local getCurrentCamera = function()
+                return Workspace.CurrentCamera
+            end
+
+            return getCurrentCamera
+        end
+
+        function __DARKLUA_BUNDLE_MODULES.k()
+            local v = __DARKLUA_BUNDLE_MODULES.cache.k
+
+            if not v then
+                v = {
+                    c = __modImpl(),
+                }
+                __DARKLUA_BUNDLE_MODULES.cache.k = v
+            end
+
+            return v.c
+        end
+    end
+    do
+        local __modImpl = function()
+            return true
+        end
+
+        function __DARKLUA_BUNDLE_MODULES.l()
+            local v = __DARKLUA_BUNDLE_MODULES.cache.l
+
+            if not v then
+                v = {
+                    c = __modImpl(),
+                }
+                __DARKLUA_BUNDLE_MODULES.cache.l = v
+            end
+
+            return v.c
+        end
+    end
+    do
+        local __modImpl = function()
+            __DARKLUA_BUNDLE_MODULES.e()
+
+            local PlayerTracker = __DARKLUA_BUNDLE_MODULES.f()
+
+            __DARKLUA_BUNDLE_MODULES.d()
+            __DARKLUA_BUNDLE_MODULES.j()
+
+            local getCurrentCamera = __DARKLUA_BUNDLE_MODULES.k()
+
+            __DARKLUA_BUNDLE_MODULES.l()
+
+            local Players = game:GetService('Players')
+            local Workspace = game:GetService('Workspace')
+            local localPlayer = Players.LocalPlayer
+            local Checks = {}
+
+            Checks.__index = Checks
+
+            function Checks.new(configuration)
+                local self = {
+                    playerTracker = PlayerTracker.new(),
+                    configuration = configuration,
+                }
+
+                return setmetatable(self, Checks)
+            end
+            function Checks.Destroy(self)
+                self.playerTracker:Destroy()
+                setmetatable(self, nil)
+            end
+            function Checks.ForceField(_self, player)
+                return player.forceField
+            end
+            function Checks.Friend(_self, player)
+                return player.friend
+            end
+            function Checks.Health(_self, player)
+                return player.health > 0
+            end
+            function Checks.Invisible(_self, part)
+                return part.Transparency == 1
+            end
+            function Checks.TeamPlayer(_self, player)
+                return player.instance.Team == localPlayer.Team
+            end
+            function Checks.IgnoredPlayer(self, player)
+                local mode = self.configuration.Ignored.Whitelist
+
+                for _, ignoredPlayer in ipairs(self.configuration.Ignored.Players)do
+                    local playerType = typeof(ignoredPlayer)
+
+                    if (playerType == 'Instance' and player.instance == ignoredPlayer) or (playerType == 'number' and player.instance.UserId) then
+                        return not mode.Players
+                    end
+                end
+
+                return false
+            end
+            function Checks.IgnoredTeam(self, player)
+                local mode = self.configuration.Ignored.Whitelist
+                local ourTeam = player.instance.Team
+
+                for _, ignoredTeam in ipairs(self.configuration.Ignored.Teams)do
+                    if ourTeam == ignoredTeam then
+                        return not mode.Teams
+                    end
+                end
+
+                return false
+            end
+            function Checks.Ignored(self, player)
+                local ignored = self.configuration.Ignored
+
+                return (ignored.IgnoreLocalTeam and self:TeamPlayer(player)) or self:IgnoredTeam(player) or self:IgnoredPlayer(player)
+            end
+            function Checks.WallHit(self, part, partAncestor, currentCamera)
+                local raycastParams = RaycastParams.new()
+
+                raycastParams.FilterType = Enum.RaycastFilterType.Exclude
+                raycastParams.FilterDescendantsInstances = self.configuration.RaycastIgnore(self.playerTracker.localPlayer, currentCamera)
+
+                local origin = currentCamera.CFrame.Position
+                local direction = part.Position - origin
+                local raycastResult = Workspace:Raycast(origin, direction, raycastParams)
+
+                if not raycastResult then
+                    return true
+                end
+
+                local partHit = raycastResult.Instance
+
+                print(partHit:GetFullName())
+
+                return partHit ~= part or not partAncestor:IsAncestorOf(partHit)
+            end
+            function Checks.PlayerCheck(self, player)
+                local configuration = self.configuration.Checks
+
+                return not ((configuration.ForceField and self:ForceField(player)) or (configuration.Friend and self:Friend(player)) or (configuration.Health and self:Health(player)))
+            end
+            function Checks.PartChecks(self, player, part, fovs, selected)
+                local configuration = self.configuration.Checks
+
+                if configuration.Invisible and self:Invisible(part) then
+                    return
+                end
+
+                local currentCamera = getCurrentCamera()
+                local screenPosition, isOnScreen = currentCamera:WorldToViewportPoint(part.Position)
+
+                if configuration.WallCheck and not isOnScreen then
+                    return
+                end
+
+                local screen2D = Vector2.new(screenPosition.X, screenPosition.Y)
+                local distance = selected.distance
+
+                for fov, data in pairs(fovs)do
+                    if not data.check then
+                        continue
+                    end
+
+                    local insideFov, distanceToFov = fov:InsideFOV(screen2D)
+
+                    if not insideFov or ((distanceToFov or math.huge) > distance) or (configuration.WallCheck == 'Full' and self:WallHit(part, (player.character), currentCamera)) then
+                        continue
+                    end
+
+                    distance = distanceToFov
+                end
+
+                if not distance or distance == math.huge then
+                    return
+                end
+
+                selected.part = part
+                selected.player = player.instance
+                selected.position = part.Position
+                selected.distance = distance
+            end
+
+            return Checks
+        end
+
+        function __DARKLUA_BUNDLE_MODULES.m()
+            local v = __DARKLUA_BUNDLE_MODULES.cache.m
+
+            if not v then
+                v = {
+                    c = __modImpl(),
+                }
+                __DARKLUA_BUNDLE_MODULES.cache.m = v
+            end
+
+            return v.c
+        end
+    end
+    do
+        local __modImpl = function()
+            __DARKLUA_BUNDLE_MODULES.e()
+            __DARKLUA_BUNDLE_MODULES.b()
+            __DARKLUA_BUNDLE_MODULES.m()
+            __DARKLUA_BUNDLE_MODULES.l()
+            __DARKLUA_BUNDLE_MODULES.d()
+            __DARKLUA_BUNDLE_MODULES.j()
+
+            return false
+        end
+
+        function __DARKLUA_BUNDLE_MODULES.n()
+            local v = __DARKLUA_BUNDLE_MODULES.cache.n
+
+            if not v then
+                v = {
+                    c = __modImpl(),
+                }
+                __DARKLUA_BUNDLE_MODULES.cache.n = v
+            end
+
+            return v.c
+        end
+    end
+    do
+        local __modImpl = function()
+            local AimworkChecks = __DARKLUA_BUNDLE_MODULES.m()
+
+            __DARKLUA_BUNDLE_MODULES.n()
+            __DARKLUA_BUNDLE_MODULES.l()
+            __DARKLUA_BUNDLE_MODULES.d()
+            __DARKLUA_BUNDLE_MODULES.j()
+
+            local PlayerCheck = AimworkChecks.PlayerCheck
+            local PartChecks = AimworkChecks.PartChecks
+
+            return function(aimwork)
+                function aimwork.checks:PlayerCheck(Player)
+                    return PlayerCheck(self, Player)
+                end
+                function aimwork.checks:PartChecks(
+                    player,
+                    parts,
+                    fovs,
+                    selected
+                )
+                    return PartChecks(self, player, parts, fovs, selected)
+                end
+            end
+        end
+
+        function __DARKLUA_BUNDLE_MODULES.o()
+            local v = __DARKLUA_BUNDLE_MODULES.cache.o
+
+            if not v then
+                v = {
+                    c = __modImpl(),
+                }
+                __DARKLUA_BUNDLE_MODULES.cache.o = v
+            end
+
+            return v.c
+        end
+    end
+    do
+        local __modImpl = function()
+            __DARKLUA_BUNDLE_MODULES.n()
+
+            return {
+                Example = __DARKLUA_BUNDLE_MODULES.o(),
+            }
+        end
+
+        function __DARKLUA_BUNDLE_MODULES.p()
+            local v = __DARKLUA_BUNDLE_MODULES.cache.p
+
+            if not v then
+                v = {
+                    c = __modImpl(),
+                }
+                __DARKLUA_BUNDLE_MODULES.cache.p = v
+            end
+
+            return v.c
+        end
+    end
+end
+
+local Trove = __DARKLUA_BUNDLE_MODULES.b()
+local patches = __DARKLUA_BUNDLE_MODULES.p()
+local Configuration = __DARKLUA_BUNDLE_MODULES.e()
+local AimworkChecks = __DARKLUA_BUNDLE_MODULES.m()
+
+__DARKLUA_BUNDLE_MODULES.d()
+
+local VisualHandler = __DARKLUA_BUNDLE_MODULES.j()
+local FovObject = __DARKLUA_BUNDLE_MODULES.i()
+
+__DARKLUA_BUNDLE_MODULES.n()
+__DARKLUA_BUNDLE_MODULES.l()
+
+local Players = game:GetService('Players')
+local RunService = game:GetService('RunService')
+local localPlayer = Players.LocalPlayer
+local defaultSelected = table.freeze({
+    player = localPlayer,
+    part = Instance.new('Part'),
+    position = Vector3.zero,
+    distance = math.huge,
+})
+local Aimwork = {}
+
+Aimwork.DefaultConfiguration = Configuration
+Aimwork.__index = Aimwork
+
+function Aimwork.new(settings)
+    local trove = Trove.new()
+    local self = {
+        _trove = trove,
+        visuals = trove:Add(VisualHandler.new()),
+        checks = trove:Add(AimworkChecks.new(settings)),
+        settings = settings,
+        selected = (table.clone(defaultSelected)),
+    }
+
+    return setmetatable(self, Aimwork)
+end
+function Aimwork.Destroy(self)
+    self._trove:Destroy()
+    setmetatable(self, nil)
+end
+function Aimwork.Initialise(self)
+    local trove = self._trove
+
+    self.visuals:Add(FovObject.new('Main', self.settings.FOVSettings))
+    trove:Connect(RunService.Heartbeat, function()
+        self:Iterate()
+    end)
+end
+function Aimwork.LoadPatch(self, patchName)
+    local patch = patches[patchName]
+
+    assert(typeof(patch) == 'function', 'could not find specified patch')
+    patch(self)
+end
+function Aimwork.IteratePlayer(self, player)
+    if player.instance == localPlayer then
+        return
+    end
+    if not self.checks:PlayerCheck(player) then
+        return
+    end
+
+    for _, bodyPart in ipairs(player.bodyParts)do
+        self.checks:PartChecks(player, bodyPart, self.visuals.objects, self.selected)
+    end
+end
+function Aimwork.Iterate(self)
+    for i, v in defaultSelected do
+        ((self.selected))[i] = v
+    end
+
+    self.visuals:Update()
+
+    for _, player in ipairs(self.checks.playerTracker.players)do
+        self:IteratePlayer(player)
+    end
+end
+
+return Aimwork
