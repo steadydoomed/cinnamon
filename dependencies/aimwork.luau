@@ -1,4 +1,4 @@
--- Credits to Stefanuk12! (goat)
+-- Made by Stefanuk12
 
 local __DARKLUA_BUNDLE_MODULES = {cache = {}}
 
